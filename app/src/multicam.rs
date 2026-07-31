@@ -32,7 +32,10 @@ fn hom(h: &[[f64; 3]; 3], x: f64, y: f64) -> (f64, f64) {
     let px = h[0][0] * x + h[0][1] * y + h[0][2];
     let py = h[1][0] * x + h[1][1] * y + h[1][2];
     let s = h[2][0] * x + h[2][1] * y + h[2][2];
-    (px / s, py / s)
+    if !s.is_finite() || s.abs() < 1e-9 { return (f64::NAN, f64::NAN); }
+    let x = px / s;
+    let y = py / s;
+    if x.is_finite() && y.is_finite() { (x, y) } else { (f64::NAN, f64::NAN) }
 }
 
 /// Global tracker over multiple camera sources. `homographies[i]` maps camera i
@@ -104,9 +107,9 @@ impl MultiCameraTracker {
                     let assigned = if assigned {
                         true
                     } else if let Some(mj) = match_j {
-                        if !matched.contains_key(&mj) {
+                        if let std::collections::hash_map::Entry::Vacant(e) = matched.entry(mj) {
                             self.ids[i].insert(id_i, mj);
-                            matched.insert(mj, true);
+                            e.insert(true);
                             true
                         } else {
                             false

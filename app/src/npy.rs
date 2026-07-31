@@ -65,8 +65,8 @@ fn extract(header: &str, key: &str) -> Option<String> {
     let rest = &header[start..];
     let rest = rest.trim_start();
     // Value is either a quoted string, a tuple, or a bare keyword.
-    let end = if rest.starts_with('\'') {
-        rest[1..].find('\'')? + 2
+    let end = if let Some(stripped) = rest.strip_prefix('\'') {
+        stripped.find('\'')? + 2
     } else if rest.starts_with('(') {
         let mut depth = 0i32;
         for (i, ch) in rest.char_indices() {

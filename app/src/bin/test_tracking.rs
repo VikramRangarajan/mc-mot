@@ -82,8 +82,8 @@ fn main() -> anyhow::Result<()> {
     let cam1_h_cam4 = inv(&h4_from_1);
     let mut global = multicam::MultiCameraTracker::new(vec![identity, cam1_h_cam4], 0.20);
 
-    let rows1: Vec<sort::Track> = t1.drain(..).collect();
-    let rows2: Vec<sort::Track> = t2.drain(..).collect();
+    let rows1: Vec<sort::Track> = std::mem::take(&mut t1);
+    let rows2: Vec<sort::Track> = std::mem::take(&mut t2);
     let ids = global.update(&[rows1, rows2]);
     println!("global ids frame0 = {ids:?}");
     let _ = as_rows;
@@ -97,8 +97,8 @@ fn main() -> anyhow::Result<()> {
         [85.0, 185.0, 135.0, 385.0, 0.9],
         [285.0, 205.0, 345.0, 415.0, 0.8],
     ];
-    let t1 = tracker1.update(&dets1.iter().map(to4).collect::<Vec<_>>(), &vec![0; 2]);
-    let t2 = tracker2.update(&dets2.iter().map(to4).collect::<Vec<_>>(), &vec![0; 2]);
+    let t1 = tracker1.update(&dets1.iter().map(to4).collect::<Vec<_>>(), &[0; 2]);
+    let t2 = tracker2.update(&dets2.iter().map(to4).collect::<Vec<_>>(), &[0; 2]);
     let ids = global.update(&[t1, t2]);
     println!("global ids frame1 = {ids:?}");
     Ok(())

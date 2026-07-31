@@ -5,7 +5,9 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const VIDEO_EXTS: &[&str] = &["mp4", "mov", "avi", "mkv", "webm", "m4v", "ts", "mpeg", "mpg", "wmv"];
+const VIDEO_EXTS: &[&str] = &[
+    "mp4", "mov", "avi", "mkv", "webm", "m4v", "ts", "mpeg", "mpg", "wmv",
+];
 
 pub fn is_video(path: &Path) -> bool {
     path.extension()

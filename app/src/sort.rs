@@ -27,8 +27,11 @@ fn linear_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
     if n == 0 {
         return Vec::new();
     }
-    let m = cost[0].len();
-    let size = m.max(n) + 1;
+    let real_m = cost[0].len();
+    let m = real_m.max(n);
+    let size = m + 1;
+    let mut padded = cost.to_vec();
+    for row in &mut padded { row.resize(m, 0.0); }
     let mut u = vec![0f64; size];
     let mut v = vec![0f64; size];
     let mut p = vec![0usize; size];
@@ -45,7 +48,7 @@ fn linear_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
             let mut j1 = 0usize;
             for j in 1..=m {
                 if !used[j] {
-                    let cur = cost[i0 - 1][j - 1] - u[i0] - v[j];
+                let cur = padded[i0 - 1][j - 1] - u[i0] - v[j];
                     if cur < minv[j] {
                         minv[j] = cur;
                         way[j] = j0;
@@ -81,13 +84,16 @@ fn linear_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
     let mut ans = vec![usize::MAX; n];
     for j in 1..=m {
         if p[j] != 0 {
-            ans[p[j] - 1] = j - 1;
+            ans[p[j] - 1] = if j <= real_m { j - 1 } else { usize::MAX };
         }
     }
     ans
 }
 
 fn iou(a: [f64; 4], b: [f64; 4]) -> f64 {
+    if a.iter().any(|v| !v.is_finite()) || b.iter().any(|v| !v.is_finite()) {
+        return 0.0;
+    }
     let xx1 = a[0].max(b[0]);
     let yy1 = a[1].max(b[1]);
     let xx2 = a[2].min(b[2]);
@@ -201,9 +207,7 @@ struct KalmanFilter {
 impl KalmanFilter {
     fn new() -> Self {
         let f = SMatrix::<f64, 7, 7>::from_fn(|r, c| {
-            if r == c {
-                1.0
-            } else if (r == 0 && c == 4) || (r == 1 && c == 5) || (r == 2 && c == 6) {
+            if r == c || (r == 0 && c == 4) || (r == 1 && c == 5) || (r == 2 && c == 6) {
                 1.0
             } else {
                 0.0
@@ -252,8 +256,11 @@ impl KalmanFilter {
     fn update(&mut self, z: Vector4<f64>) {
         let y = z - self.h * self.x;
         let s = self.h * self.p * self.h.transpose() + self.r;
-        let k = self.p * self.h.transpose() * s.try_inverse().unwrap();
-        self.x = self.x + k * y;
+        let Some(s_inv) = s.try_inverse() else {
+            return;
+        };
+        let k = self.p * self.h.transpose() * s_inv;
+        self.x += k * y;
         self.p = self.p - k * self.h * self.p;
     }
 }
@@ -293,9 +300,9 @@ pub fn associate_detections_to_trackers(
             .unwrap();
         if a_sum_rows == 1 && a_sum_cols == 1 {
             let mut m = Vec::new();
-            for i in 0..rows {
-                for j in 0..cols {
-                    if iou_m[i][j] > iou_threshold {
+            for (i, row) in iou_m.iter().enumerate().take(rows) {
+                for (j, value) in row.iter().enumerate().take(cols) {
+                    if *value > iou_threshold {
                         m.push((i, j));
                     }
                 }

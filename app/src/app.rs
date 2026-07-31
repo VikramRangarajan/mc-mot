@@ -51,6 +51,8 @@ pub struct McMotApp {
     /// Last displayed results.
     vis1: Option<egui::ColorImage>,
     vis2: Option<egui::ColorImage>,
+    tex1: Option<egui::TextureHandle>,
+    tex2: Option<egui::TextureHandle>,
     tracks1: Vec<Track>,
     tracks2: Vec<Track>,
     global_ids: Vec<HashMap<i64, i64>>,
@@ -108,7 +110,12 @@ impl McMotApp {
             .join("data/cam4_H_cam1.npy");
 
         let model = match dnn::read_net_from_onnx_def(model_path.to_str().unwrap()) {
-            Ok(net) => Some(net),
+            Ok(mut net) => {
+                if let Err(e) = opencv::prelude::NetTrait::set_preferable_backend(&mut net, dnn::DNN_BACKEND_OPENCV) {
+                    eprintln!("warning: could not select OpenCV DNN backend: {e}");
+                }
+                Some(net)
+            }
             Err(e) => {
                 eprintln!("warning: failed to load ONNX model from {model_path:?}: {e}");
                 None
@@ -136,7 +143,7 @@ impl McMotApp {
         let tracker1 = Sort::new(30, 3, 0.3, &count);
         let tracker2 = Sort::new(30, 3, 0.3, &count);
 
-        Self {
+        let mut app = Self {
             model,
             homographies,
             font,
@@ -156,6 +163,8 @@ impl McMotApp {
             running: false,
             vis1: None,
             vis2: None,
+            tex1: None,
+            tex2: None,
             tracks1: Vec::new(),
             tracks2: Vec::new(),
             global_ids: Vec::new(),
@@ -165,7 +174,19 @@ impl McMotApp {
             min_hits: 1,
             max_age: 30,
             fps: 0.0,
+        };
+
+        // Debug defaults: load the repository videos automatically when present.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
+        for (path, cam) in [(root.join("data/cam1.mp4"), &mut app.cam1), (root.join("data/cam4.mp4"), &mut app.cam2)] {
+            if path.exists() {
+                match video::extract_frames(&path) {
+                    Ok(extracted) => { cam.frames = extracted.frames.clone(); cam.video = Some(extracted); }
+                    Err(e) => app.status = format!("failed to load {}: {e}", path.display()),
+                }
+            }
         }
+        app
     }
 
     fn reset_pipeline(&mut self) {
@@ -176,6 +197,8 @@ impl McMotApp {
         self.frame = 0;
         self.vis1 = None;
         self.vis2 = None;
+        self.tex1 = None;
+        self.tex2 = None;
         self.tracks1.clear();
         self.tracks2.clear();
         self.hist1.clear();
@@ -184,6 +207,7 @@ impl McMotApp {
 
     /// Runs one frame couple through detect -> SORT -> global tracker.
     fn step(&mut self) {
+        eprintln!("[app] step frame={}", self.frame);
         let Some(model) = self.model.as_mut() else {
             self.status = "no model loaded".to_string();
             return;
@@ -218,11 +242,25 @@ impl McMotApp {
                 return;
             }
         };
+        eprintln!("[app] images loaded frame={}", i);
 
         let t0 = std::time::Instant::now();
         let conf = self.conf;
-        let dets1 = detect::detect(model, &img1, conf, 0.45).unwrap_or_default();
-        let dets2 = detect::detect(model, &img2, conf, 0.45).unwrap_or_default();
+        let dets1 = match detect::detect(model, &img1, conf, 0.45) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("camera 1 detection failed: {e}");
+                return;
+            }
+        };
+        let dets2 = match detect::detect(model, &img2, conf, 0.45) {
+            Ok(d) => d,
+            Err(e) => {
+                self.status = format!("camera 2 detection failed: {e}");
+                return;
+            }
+        };
+        eprintln!("[app] detections {} {}", dets1.len(), dets2.len());
 
         // SORT expects integer bboxes.
         let to_xyxy = |d: &Detection| {
@@ -241,11 +279,13 @@ impl McMotApp {
 
         let tracks1 = self.tracker1.update(&dets1, &labels1);
         let tracks2 = self.tracker2.update(&dets2, &labels2);
+        eprintln!("[app] sort tracks {} {}", tracks1.len(), tracks2.len());
 
         let global_tracker = self
             .global_tracker
             .get_or_insert_with(|| MultiCameraTracker::new(self.homographies.clone(), 0.20));
         let global_ids = global_tracker.update(&[tracks1.clone(), tracks2.clone()]);
+        eprintln!("[app] global tracker done");
 
         let vis1 = draw::draw_tracks(&img1, &tracks1, &global_ids[0], &mut self.hist1, &self.font);
         let vis2 = draw::draw_tracks(&img2, &tracks2, &global_ids[1], &mut self.hist2, &self.font);
@@ -269,6 +309,7 @@ impl McMotApp {
             self.tracks2.len(),
             elapsed
         );
+        eprintln!("[app] frame complete {}", i);
     }
 }
 
@@ -283,11 +324,15 @@ fn pick_source(cam: &mut CameraSource) -> String {
         )
         .add_filter(
             "Images",
-            &["png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "ico", "pnm"],
+            &[
+                "png", "jpg", "jpeg", "bmp", "gif", "webp", "tiff", "ico", "pnm",
+            ],
         )
         .add_filter(
             "Videos",
-            &["mp4", "mov", "avi", "mkv", "webm", "m4v", "ts", "mpeg", "mpg", "wmv"],
+            &[
+                "mp4", "mov", "avi", "mkv", "webm", "m4v", "ts", "mpeg", "mpg", "wmv",
+            ],
         )
         .pick_files();
 
@@ -320,29 +365,43 @@ fn load_font() -> FontArc {
         "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
         "/System/Library/Fonts/Helvetica.ttc",
     ] {
-        if let Ok(data) = std::fs::read(path) {
-            if let Ok(font) = FontArc::try_from_vec(data) {
-                return font;
-            }
+        if let Ok(data) = std::fs::read(path)
+            && let Ok(font) = FontArc::try_from_vec(data)
+        {
+            return font;
         }
     }
-    FontArc::try_from_slice(include_bytes!("/System/Library/Fonts/Supplemental/Arial.ttf"))
-        .unwrap_or_else(|_| panic!("no font available"))
+    FontArc::try_from_slice(include_bytes!(
+        "/System/Library/Fonts/Supplemental/Arial.ttf"
+    ))
+    .unwrap_or_else(|_| panic!("no font available"))
 }
 
 /// Shows one camera preview scaled to fit the given max size, preserving
 /// aspect ratio.
-fn show_image(ui: &mut egui::Ui, label: &str, img: &Option<egui::ColorImage>, max: egui::Vec2) {
+fn show_image(
+    ui: &mut egui::Ui,
+    label: &str,
+    img: &Option<egui::ColorImage>,
+    tex: &mut Option<egui::TextureHandle>,
+    max: egui::Vec2,
+) {
     if let Some(img) = img {
         ui.label(label);
-        let tex = ui
-            .ctx()
-            .load_texture(label, img.clone(), Default::default());
+        if let Some(texture) = tex {
+            texture.set(img.clone(), egui::TextureOptions::LINEAR);
+        } else {
+            *tex = Some(
+                ui.ctx()
+                    .load_texture(label, img.clone(), egui::TextureOptions::LINEAR),
+            );
+        }
+        let texture = tex.as_ref().unwrap();
         let img_size = egui::vec2(img.size[0] as f32, img.size[1] as f32);
         let scale = (max.x / img_size.x).min(max.y / img_size.y).min(1.0);
         let shown = img_size * scale;
         ui.add(
-            egui::Image::new(egui::load::SizedTexture::new(&tex, shown))
+            egui::Image::new(egui::load::SizedTexture::new(texture, shown))
                 .max_size(shown)
                 .maintain_aspect_ratio(true),
         );
@@ -415,9 +474,7 @@ impl eframe::App for McMotApp {
             if self.running {
                 self.step();
                 // keep stepping until both sources are exhausted
-                if self.frame >= self.cam1.frames.len()
-                    || self.frame >= self.cam2.frames.len()
-                {
+                if self.frame >= self.cam1.frames.len() || self.frame >= self.cam2.frames.len() {
                     self.running = false;
                 }
                 ui.ctx().request_repaint();
@@ -432,7 +489,7 @@ impl eframe::App for McMotApp {
                 ui.centered_and_justified(|ui| {
                     ui.label(
                         "Add images or videos for camera 1 and camera 2, then press Run.\n\
-                         The pipeline is: YOLOX person detection -> per-camera SORT ->\n\
+                         The pipeline is: YOLO ONNX person detection -> per-camera SORT ->\n\
                          homography-based global track fusion.",
                     );
                 });
@@ -442,8 +499,8 @@ impl eframe::App for McMotApp {
                     let spacing = 16.0;
                     let max = egui::vec2((avail.x - spacing) / 2.0, avail.y);
                     ui.horizontal(|ui| {
-                        show_image(ui, &self.cam1.name, &self.vis1, max);
-                        show_image(ui, &self.cam2.name, &self.vis2, max);
+                        show_image(ui, &self.cam1.name, &self.vis1, &mut self.tex1, max);
+                        show_image(ui, &self.cam2.name, &self.vis2, &mut self.tex2, max);
                     });
                 });
             }
