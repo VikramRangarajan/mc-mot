@@ -104,9 +104,9 @@ class KalmanBoxTracker(object):
         )
 
         self.kf.R[2:, 2:] *= 10.0
-        self.kf.P[
-            4:, 4:
-        ] *= 1000.0  # give high uncertainty to the unobservable initial velocities
+        self.kf.P[4:, 4:] *= (
+            1000.0  # give high uncertainty to the unobservable initial velocities
+        )
         self.kf.P *= 10.0
         self.kf.Q[-1, -1] *= 0.01
         self.kf.Q[4:, 4:] *= 0.01
@@ -260,6 +260,6 @@ class Sort(object):
             if trk.time_since_update > self.max_age:
                 self.trackers.pop(i)
         if len(ret) > 0:
-            return np.int0(np.concatenate(ret))
+            return np.intp(np.concatenate(ret))
 
         return np.empty((0, 5))

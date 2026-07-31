@@ -1,10 +1,14 @@
-import torch
-import numpy as np
-import cv2
+import os
 
+import cv2
+import numpy as np
+import torch
+
+import homography_tracker
 import sort
 import utilities
-import homography_tracker
+
+os.environ["YOLO_AUTOINSTALL"] = "0"
 
 
 def main(opts):
@@ -48,6 +52,8 @@ def main(opts):
         # Get frames
         frame1 = video1.read()[1]
         frame2 = video2.read()[1]
+        if frame1 is None or frame2 is None:
+            break
 
         # NOTE: YoloV5 expects the images to be RGB instead of BGR
         frames = [frame1[:, :, ::-1], frame2[:, :, ::-1]]
@@ -58,7 +64,7 @@ def main(opts):
         for i in range(len(anno)):
             # Sort Tracker requires (x1, y1, x2, y2) bounding box shape
             det = anno.xyxy[i].cpu().numpy()
-            det[:, :4] = np.int0(det[:, :4])
+            det[:, :4] = np.intp(det[:, :4])
             dets.append(det)
 
             # Updating each tracker measures

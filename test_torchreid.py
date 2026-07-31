@@ -1,7 +1,7 @@
-import torchreid
-import torch
-import numpy as np
 import cv2
+import numpy as np
+import torch
+import torchreid
 from scipy.optimize import linear_sum_assignment
 
 
@@ -49,14 +49,14 @@ for idx in range(num_frames):
     cam1_features = []
     cam2_features = []
     for pred in preds1:
-        x1, y1, x2, y2, _, _ = np.int0(pred)
+        x1, y1, x2, y2, _, _ = np.intp(pred)
         crop = frame1[y1:y2, x1:x2, :]
 
         feat = extractor(crop)[0].cpu().numpy()
         feat = feat / np.linalg.norm(feat)
         cam1_features.append(feat)
     for pred in preds2:
-        x1, y1, x2, y2, _, _ = np.int0(pred)
+        x1, y1, x2, y2, _, _ = np.intp(pred)
         crop = frame2[y1:y2, x1:x2, :]
 
         feat = extractor(crop)[0].cpu().numpy()
@@ -74,7 +74,7 @@ for idx in range(num_frames):
             continue
         else:
             # Draw bounding boxes
-            x1, y1, x2, y2, _, _ = np.int0(preds1[match[0]])
+            x1, y1, x2, y2, _, _ = np.intp(preds1[match[0]])
             cv2.rectangle(frame1, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(
                 frame1,
@@ -85,7 +85,7 @@ for idx in range(num_frames):
                 (0, 255, 0),
                 2,
             )
-            x1, y1, x2, y2, _, _ = np.int0(preds2[match[1]])
+            x1, y1, x2, y2, _, _ = np.intp(preds2[match[1]])
             cv2.rectangle(frame2, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(
                 frame2, f"{idx}", (x1, y1), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2

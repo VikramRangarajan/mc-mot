@@ -1,0 +1,18 @@
+[project]
+name = "mc-mot"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "filterpy>=1.4.5",
+    "matplotlib>=3.10.9",
+    "numpy>=2.2.6",
+    "opencv-contrib-python>=5.0.0.93",
+    "opencv-python>=5.0.0.93",
+    "pandas>=2.3.3",
+    "scipy>=1.15.3",
+    "torchreid>=0.2.5",
+    "tqdm>=4.70.0",
+    "ultralytics==8.3.*",
+]

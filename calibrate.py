@@ -1,6 +1,6 @@
-import torch
-import numpy as np
 import cv2
+import numpy as np
+import torch
 
 import utilities
 
@@ -36,8 +36,8 @@ def main(opts):
 
     np.save(f"{opts.homography_pth}.npy", cam4_H_cam1)
 
-    src_pts = np.int0(src_pts).reshape(-1, 2)
-    dst_pts = np.int0(dst_pts).reshape(-1, 2)
+    src_pts = np.intp(src_pts).reshape(-1, 2)
+    dst_pts = np.intp(dst_pts).reshape(-1, 2)
 
     img_with_matches = utilities.draw_matches(frame1, src_pts, frame2, dst_pts, good)
 

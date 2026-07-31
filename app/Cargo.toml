@@ -1,0 +1,19 @@
+[package]
+name = "mc-mot"
+version = "0.1.0"
+edition = "2024"
+description = "Multi-camera multi-object tracking demo (Rust GUI)"
+license = "MIT OR Apache-2.0"
+default-run = "mc-mot"
+
+[dependencies]
+anyhow = "1"
+eframe = "0.35"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "gif", "webp", "tiff", "ico", "pnm"] }
+nalgebra = { version = "0.35", default-features = false, features = ["std"] }
+opencv = { version = "0.100", features = ["dnn", "highgui", "videoio"] }
+rfd = "0.17"
+ab_glyph = "0.2"
+
+[profile.release]
+lto = "thin"

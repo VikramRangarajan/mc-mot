@@ -1,9 +1,0 @@
-ultralytics
-opencv-python
-opencv-contrib-python
-torchreid
-numpy
-filterpy
-scipy
-matplotlib
-tqdm

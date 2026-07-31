@@ -1,7 +1,6 @@
 import cv2
 import numpy as np
 
-
 centroids = {}
 
 
@@ -51,7 +50,7 @@ def draw_bounding_boxes(image, bounding_boxes, color=(0, 255, 0), thickness=2):
     """
 
     for bbox in bounding_boxes:
-        x1, y1, x2, y2 = np.int0(bbox)
+        x1, y1, x2, y2 = np.intp(bbox)
         cv2.rectangle(image, (x1, y1), (x2, y2), color, thickness)
 
 
@@ -100,7 +99,7 @@ def draw_tracks(image, tracks, ids_dict, src, classes=None):
         color = color_from_id(id)
 
         # Get the box coordinates
-        x1, y1, x2, y2 = np.int0(box)
+        x1, y1, x2, y2 = np.intp(box)
 
         # Draw the box on the image
         if centroids == None:
@@ -148,11 +147,11 @@ def draw_history(image, box, centroids, color):
     vis = np.array(image)
 
     # Draw the bounding box on the image
-    x1, y1, x2, y2 = np.int0(box)
+    x1, y1, x2, y2 = np.intp(box)
     thickness = 2
     cv2.rectangle(vis, (x1, y1), (x2, y2), color, thickness)
 
-    centroids = np.int0(centroids)
+    centroids = np.intp(centroids)
     # Draw the historical centroids on the vis
     for i, centroid in enumerate(centroids):
         if i == 0:
