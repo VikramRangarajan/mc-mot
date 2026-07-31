@@ -41,10 +41,13 @@ fn line(img: &mut RgbImage, mut x0: i32, mut y0: i32, x1: i32, y1: i32, c: Rgb<u
     }
 }
 fn rect(img: &mut RgbImage, x1: i32, y1: i32, x2: i32, y2: i32, c: Rgb<u8>) {
-    line(img, x1, y1, x2, y1, c);
-    line(img, x2, y1, x2, y2, c);
-    line(img, x2, y2, x1, y2, c);
-    line(img, x1, y2, x1, y1, c);
+    // Draw a 3-pixel outline for visibility at the GUI's downscaled preview.
+    for d in -1..=1 {
+        line(img, x1 + d, y1 + d, x2 - d, y1 + d, c);
+        line(img, x2 - d, y1 + d, x2 - d, y2 - d, c);
+        line(img, x2 - d, y2 - d, x1 + d, y2 - d, c);
+        line(img, x1 + d, y2 - d, x1 + d, y1 + d, c);
+    }
 }
 pub fn draw_tracks(
     img: &RgbImage,

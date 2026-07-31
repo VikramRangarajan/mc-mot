@@ -65,6 +65,7 @@ pub struct McMotApp {
     conf: f32,
     min_hits: i64,
     max_age: i64,
+    iou_thres: f64,
     fps: f64,
 }
 
@@ -103,7 +104,7 @@ impl McMotApp {
         let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("models/yolov5s.onnx");
+            .join("models/yolov5m.onnx");
         let homography_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
@@ -140,8 +141,8 @@ impl McMotApp {
         let font = load_font();
 
         let count = shared_id();
-        let tracker1 = Sort::new(30, 3, 0.3, &count);
-        let tracker2 = Sort::new(30, 3, 0.3, &count);
+        let tracker1 = Sort::new(30, 1, 0.1, &count);
+        let tracker2 = Sort::new(30, 1, 0.1, &count);
 
         let mut app = Self {
             model,
@@ -170,9 +171,10 @@ impl McMotApp {
             global_ids: Vec::new(),
             hist1: HashMap::new(),
             hist2: HashMap::new(),
-            conf: 0.02,
+            conf: 0.30,
             min_hits: 1,
             max_age: 30,
+            iou_thres: 0.10,
             fps: 0.0,
         };
 
@@ -191,8 +193,8 @@ impl McMotApp {
 
     fn reset_pipeline(&mut self) {
         let count = shared_id();
-        self.tracker1 = Sort::new(self.max_age, self.min_hits, 0.3, &count);
-        self.tracker2 = Sort::new(self.max_age, self.min_hits, 0.3, &count);
+        self.tracker1 = Sort::new(self.max_age, self.min_hits, self.iou_thres, &count);
+        self.tracker2 = Sort::new(self.max_age, self.min_hits, self.iou_thres, &count);
         self.global_tracker = None;
         self.frame = 0;
         self.vis1 = None;
@@ -283,7 +285,7 @@ impl McMotApp {
 
         let global_tracker = self
             .global_tracker
-            .get_or_insert_with(|| MultiCameraTracker::new(self.homographies.clone(), 0.20));
+            .get_or_insert_with(|| MultiCameraTracker::new(self.homographies.clone(), self.iou_thres));
         let global_ids = global_tracker.update(&[tracks1.clone(), tracks2.clone()]);
         eprintln!("[app] global tracker done");
 
@@ -429,12 +431,15 @@ impl eframe::App for McMotApp {
                     self.reset_pipeline();
                     self.step();
                 }
-                if ui.button("Step").clicked() {
-                    self.running = false;
-                    if self.frame == 0 {
-                        self.reset_pipeline();
-                    }
-                    self.step();
+                if ui.button(if self.running { "Pause" } else { "Play" }).clicked() {
+                    self.running = !self.running;
+                    if self.running { ui.ctx().request_repaint(); }
+                }
+                if ui.button("Step").clicked() && !self.running {
+                        if self.frame == 0 {
+                            self.reset_pipeline();
+                        }
+                        self.step();
                 }
                 if ui.button("Clear").clicked() {
                     self.cam1.clear();
@@ -462,6 +467,8 @@ impl eframe::App for McMotApp {
                 ui.add(egui::Slider::new(&mut self.min_hits, 1..=10).show_value(true));
                 ui.label("max age");
                 ui.add(egui::Slider::new(&mut self.max_age, 1..=120).show_value(true));
+                ui.label("SORT IOU");
+                ui.add(egui::Slider::new(&mut self.iou_thres, 0.0..=1.0).step_by(0.01).show_value(true));
                 if self.fps > 0.0 {
                     ui.separator();
                     ui.label(format!("{:.1} fps", self.fps));
