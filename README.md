@@ -94,4 +94,5 @@ This repository was tested with the following specs:
 
 You should have similar results with similar hardware as above.
 
-If you run on a CPU, try to change the Yolo model to the smaller one.
+The Rust app uses the Apache-2.0 RF-DETR Medium ONNX export through OpenCV DNN.
+If you run on a CPU, export/use the RF-DETR Nano or Small variant instead.

@@ -3,10 +3,10 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::calibration;
 use crate::detect::Detection;
 use crate::draw;
 use crate::multicam::MultiCameraTracker;
-use crate::npy;
 use crate::pipeline::{FramePair, FramePipeline, OpenCvOnnxPipeline};
 use crate::sort::{Sort, Track, shared_id};
 use crate::video::{self, ExtractedVideo};
@@ -68,34 +68,15 @@ pub struct McMotApp {
     fps: f64,
     pipeline: Option<OpenCvOnnxPipeline>,
     pending_pipeline: bool,
+    playback_speed: f32,
+    cache: Vec<Option<CachedFrame>>,
 }
 
-fn homography_to_array(data: &[f64]) -> [[f64; 3]; 3] {
-    let mut h = [[0.0; 3]; 3];
-    for r in 0..3 {
-        for c in 0..3 {
-            h[r][c] = data[r * 3 + c];
-        }
-    }
-    h
-}
-
-fn invert_homography(h: &[[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let det = h[0][0] * (h[1][1] * h[2][2] - h[1][2] * h[2][1])
-        - h[0][1] * (h[1][0] * h[2][2] - h[1][2] * h[2][0])
-        + h[0][2] * (h[1][0] * h[2][1] - h[1][1] * h[2][0]);
-    let d = det;
-    let mut r = [[0.0; 3]; 3];
-    r[0][0] = (h[1][1] * h[2][2] - h[1][2] * h[2][1]) / d;
-    r[0][1] = (h[0][2] * h[2][1] - h[0][1] * h[2][2]) / d;
-    r[0][2] = (h[0][1] * h[1][2] - h[0][2] * h[1][1]) / d;
-    r[1][0] = (h[1][2] * h[2][0] - h[1][0] * h[2][2]) / d;
-    r[1][1] = (h[0][0] * h[2][2] - h[0][2] * h[2][0]) / d;
-    r[1][2] = (h[0][2] * h[1][0] - h[0][0] * h[1][2]) / d;
-    r[2][0] = (h[1][0] * h[2][1] - h[1][1] * h[2][0]) / d;
-    r[2][1] = (h[0][1] * h[2][0] - h[0][0] * h[2][1]) / d;
-    r[2][2] = (h[0][0] * h[1][1] - h[0][1] * h[1][0]) / d;
-    r
+#[derive(Clone)]
+struct CachedFrame {
+    tracks1: Vec<Track>,
+    tracks2: Vec<Track>,
+    global_ids: Vec<HashMap<i64, i64>>,
 }
 
 impl McMotApp {
@@ -105,25 +86,10 @@ impl McMotApp {
         let model_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .unwrap()
-            .join("models/yolov5m.onnx");
-        let homography_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .join("data/cam4_H_cam1.npy");
-
-        let (homographies, status) = match npy::load_f64_2d(homography_path.to_str().unwrap()) {
-            Ok((data, rows, cols)) if rows == 3 && cols == 3 => {
-                let h_c4_from_c1 = homography_to_array(&data);
-                let h_c1_from_c4 = invert_homography(&h_c4_from_c1);
-                let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-                (
-                    vec![identity, h_c1_from_c4],
-                    format!("homography loaded from {homography_path:?}"),
-                )
-            }
-            Ok(_) => (Vec::new(), "homography has wrong shape".to_string()),
-            Err(e) => (Vec::new(), format!("failed to load homography: {e}")),
-        };
+            .join("models/rfdetr-medium.onnx");
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let homographies = vec![identity, identity];
+        let status = "calibrating homography online...".to_string();
 
         // Load a system font for drawing labels.
         let font = load_font();
@@ -165,6 +131,8 @@ impl McMotApp {
             fps: 0.0,
             pipeline: None,
             pending_pipeline: false,
+            playback_speed: 1.0,
+            cache: Vec::new(),
         };
 
         // Debug defaults: load the repository videos automatically when present.
@@ -184,6 +152,20 @@ impl McMotApp {
                     }
                     Err(e) => app.status = format!("failed to load {}: {e}", path.display()),
                 }
+            }
+        }
+        if let (Some(path1), Some(path2)) = (app.cam1.frames.first(), app.cam2.frames.first()) {
+            match (image::open(path1), image::open(path2)) {
+                (Ok(first), Ok(second)) => {
+                    match calibration::estimate(&first.to_rgb8(), &second.to_rgb8()) {
+                        Ok(h) => {
+                            app.homographies = vec![identity, calibration::invert(&h)];
+                            app.status = "online SIFT homography calibrated".into();
+                        }
+                        Err(e) => app.status = format!("online homography failed: {e}"),
+                    }
+                }
+                _ => app.status = "could not load calibration frames".into(),
             }
         }
         match OpenCvOnnxPipeline::start(model_path) {
@@ -226,6 +208,46 @@ impl McMotApp {
         if i >= self.cam1.frames.len() || i >= self.cam2.frames.len() {
             self.status = "all frames processed".to_string();
             self.running = false;
+            return;
+        }
+
+        // Replays and backward scrubs use metadata only; source images are
+        // decoded on demand and no detector inference is performed.
+        if let Some(Some(cached)) = self.cache.get(i).cloned()
+            && let (Ok(image1), Ok(image2)) = (
+                image::open(&self.cam1.frames[i]),
+                image::open(&self.cam2.frames[i]),
+            )
+        {
+            let image1 = image1.to_rgb8();
+            let image2 = image2.to_rgb8();
+            let vis1 = draw::draw_tracks(
+                &image1,
+                &cached.tracks1,
+                &cached.global_ids[0],
+                &mut self.hist1,
+                &self.font,
+            );
+            let vis2 = draw::draw_tracks(
+                &image2,
+                &cached.tracks2,
+                &cached.global_ids[1],
+                &mut self.hist2,
+                &self.font,
+            );
+            self.vis1 = Some(egui::ColorImage::from_rgb(
+                [vis1.width() as usize, vis1.height() as usize],
+                vis1.as_raw(),
+            ));
+            self.vis2 = Some(egui::ColorImage::from_rgb(
+                [vis2.width() as usize, vis2.height() as usize],
+                vis2.as_raw(),
+            ));
+            self.tracks1 = cached.tracks1;
+            self.tracks2 = cached.tracks2;
+            self.global_ids = cached.global_ids;
+            self.frame += 1;
+            self.status = format!("cached frame {}", i);
             return;
         }
 
@@ -308,6 +330,14 @@ impl McMotApp {
         self.tracks1 = tracks1;
         self.tracks2 = tracks2;
         self.global_ids = global_ids;
+        if self.cache.len() <= i {
+            self.cache.resize_with(i + 1, || None);
+        }
+        self.cache[i] = Some(CachedFrame {
+            tracks1: self.tracks1.clone(),
+            tracks2: self.tracks2.clone(),
+            global_ids: self.global_ids.clone(),
+        });
         self.frame += 1;
         let elapsed = t0.elapsed();
         self.fps = 1.0 / elapsed.as_secs_f64();
@@ -433,31 +463,11 @@ impl eframe::App for McMotApp {
                     self.status = msg;
                 }
                 ui.separator();
-                if ui.button("Run").clicked() {
-                    self.running = true;
-                    self.reset_pipeline();
-                    self.step();
-                }
-                if ui
-                    .button(if self.running { "Pause" } else { "Play" })
-                    .clicked()
-                {
-                    self.running = !self.running;
-                    if self.running {
-                        ui.ctx().request_repaint();
-                    }
-                }
-                if ui.button("Step").clicked() && !self.running {
-                    if self.frame == 0 {
-                        self.reset_pipeline();
-                    }
-                    self.step();
-                    ui.ctx().request_repaint();
-                }
                 if ui.button("Clear").clicked() {
                     self.cam1.clear();
                     self.cam2.clear();
                     self.reset_pipeline();
+                    self.cache.clear();
                     self.status.clear();
                 }
                 ui.separator();
@@ -494,6 +504,73 @@ impl eframe::App for McMotApp {
             ui.add_space(4.0);
         });
 
+        egui::Panel::bottom("transport").show(ui, |ui| {
+            let frame_count = self.cam1.frames.len().min(self.cam2.frames.len());
+            let mut selected = self.frame.min(frame_count.saturating_sub(1));
+            if frame_count > 0
+                && ui
+                    .add(egui::Slider::new(&mut selected, 0..=frame_count - 1).text("Frame"))
+                    .changed()
+                && selected != self.frame
+            {
+                // Scrubbing always takes control away from playback.
+                self.running = false;
+                self.reset_pipeline();
+                self.frame = selected;
+                // Show the selected source images immediately. Tracking overlays
+                // are applied when cached metadata is available or when the
+                // selected frame is processed with Step/Play.
+                if let Ok(image) = image::open(&self.cam1.frames[selected]) {
+                    let image = image.to_rgb8();
+                    self.vis1 = Some(egui::ColorImage::from_rgb(
+                        [image.width() as usize, image.height() as usize],
+                        image.as_raw(),
+                    ));
+                }
+                if let Ok(image) = image::open(&self.cam2.frames[selected]) {
+                    let image = image.to_rgb8();
+                    self.vis2 = Some(egui::ColorImage::from_rgb(
+                        [image.width() as usize, image.height() as usize],
+                        image.as_raw(),
+                    ));
+                }
+                self.status = format!("seeked to frame {selected}");
+            }
+            ui.horizontal(|ui| {
+                if ui
+                    .button(if self.running { "Pause" } else { "Play" })
+                    .clicked()
+                {
+                    self.running = !self.running;
+                    if self.running {
+                        ui.ctx().request_repaint();
+                    }
+                }
+                if ui.button("Step").clicked() && !self.running {
+                    self.step();
+                    ui.ctx().request_repaint();
+                }
+                ui.separator();
+                ui.label("Speed");
+                egui::ComboBox::from_id_salt("playback_speed")
+                    .selected_text(format!("{}x", self.playback_speed))
+                    .show_ui(ui, |ui| {
+                        for speed in [0.5_f32, 1.0, 1.5, 2.0] {
+                            ui.selectable_value(
+                                &mut self.playback_speed,
+                                speed,
+                                format!("{}x", speed),
+                            );
+                        }
+                    });
+                ui.label(format!(
+                    "frame {}/{}",
+                    self.frame,
+                    frame_count.saturating_sub(1)
+                ));
+            });
+        });
+
         egui::CentralPanel::default().show(ui, |ui| {
             if self.pending_pipeline {
                 ui.ctx()
@@ -505,7 +582,11 @@ impl eframe::App for McMotApp {
                 if self.frame >= self.cam1.frames.len() || self.frame >= self.cam2.frames.len() {
                     self.running = false;
                 }
-                ui.ctx().request_repaint();
+                // The source videos are 30 FPS. Inference remains asynchronous;
+                // this controls the pacing between completed frame requests.
+                let interval = 1.0 / (30.0 * self.playback_speed as f64);
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_secs_f64(interval));
             }
 
             if !self.status.is_empty() {
@@ -516,20 +597,24 @@ impl eframe::App for McMotApp {
             if self.vis1.is_none() && self.vis2.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        "Add images or videos for camera 1 and camera 2, then press Run.\n\
-                         The pipeline is: YOLO ONNX person detection -> per-camera SORT ->\n\
+                        "Add images or videos for camera 1 and camera 2, then press Play.\n\
+                         The pipeline is: RF-DETR ONNX person detection -> per-camera SORT ->\n\
                          homography-based global track fusion.",
                     );
                 });
             } else {
                 egui::ScrollArea::both().show(ui, |ui| {
                     let avail = ui.available_size();
-                    let spacing = 16.0;
-                    let max = egui::vec2((avail.x - spacing) / 2.0, avail.y);
-                    ui.horizontal(|ui| {
-                        show_image(ui, &self.cam1.name, &self.vis1, &mut self.tex1, max);
-                        show_image(ui, &self.cam2.name, &self.vis2, &mut self.tex2, max);
-                    });
+                    let spacing = 12.0;
+                    let max = egui::vec2((avail.x - spacing) / 2.0, (avail.y - spacing) / 2.0);
+                    egui::Grid::new("camera_grid")
+                        .num_columns(2)
+                        .spacing(egui::vec2(spacing, spacing))
+                        .show(ui, |ui| {
+                            show_image(ui, &self.cam1.name, &self.vis1, &mut self.tex1, max);
+                            show_image(ui, &self.cam2.name, &self.vis2, &mut self.tex2, max);
+                            ui.end_row();
+                        });
                 });
             }
         });

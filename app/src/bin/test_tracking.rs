@@ -1,34 +1,14 @@
 #[path = "../multicam.rs"]
 mod multicam;
-#[path = "../npy.rs"]
-mod npy;
 #[path = "../sort.rs"]
 mod sort;
 
-use std::path::PathBuf;
-
 fn main() -> anyhow::Result<()> {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .to_path_buf();
-    let data_dir = root.join("data");
-
-    // Load homography like main.py does.
-    let (hdata, rows, cols) = npy::load_f64_2d(data_dir.join("cam4_H_cam1.npy").to_str().unwrap())?;
-    assert_eq!((rows, cols), (3, 3));
-    let mut h4_from_1 = [[0.0f64; 3]; 3];
-    for r in 0..3 {
-        for c in 0..3 {
-            h4_from_1[r][c] = hdata[r * 3 + c];
-        }
-    }
-
     let count = sort::shared_id();
     let mut tracker1 = sort::Sort::new(30, 3, 0.3, &count);
     let mut tracker2 = sort::Sort::new(30, 3, 0.3, &count);
 
-    // Use precomputed detection boxes: open wildtrack frames and run YOLOX is
+    // Use precomputed detection boxes: open wildtrack frames and run the detector is
     // overkill here; instead simulate a couple of moving boxes per camera.
     // Frame 0: two people per camera.
     let dets1 = [
@@ -57,30 +37,10 @@ fn main() -> anyhow::Result<()> {
             .collect()
     };
 
-    // Use a fake homography = inverse of h4_from_1 for camera 2 (identity for camera 1).
+    // Synthetic tracker test uses identity homographies. Runtime calibration
+    // is performed by the SIFT/RANSAC pipeline in the main application.
     let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    // NOTE: we need cam1_H_cam4 = inv(cam4_H_cam1). Compute it here.
-    // (Implemented in app.rs; replicate minimal inversion.)
-    let det_h = h4_from_1[0][0]
-        * (h4_from_1[1][1] * h4_from_1[2][2] - h4_from_1[1][2] * h4_from_1[2][1])
-        - h4_from_1[0][1] * (h4_from_1[1][0] * h4_from_1[2][2] - h4_from_1[1][2] * h4_from_1[2][0])
-        + h4_from_1[0][2] * (h4_from_1[1][0] * h4_from_1[2][1] - h4_from_1[1][1] * h4_from_1[2][0]);
-    let inv = |m: &[[f64; 3]; 3]| -> [[f64; 3]; 3] {
-        let d = det_h;
-        let mut r = [[0.0; 3]; 3];
-        r[0][0] = (m[1][1] * m[2][2] - m[1][2] * m[2][1]) / d;
-        r[0][1] = (m[0][2] * m[2][1] - m[0][1] * m[2][2]) / d;
-        r[0][2] = (m[0][1] * m[1][2] - m[0][2] * m[1][1]) / d;
-        r[1][0] = (m[1][2] * m[2][0] - m[1][0] * m[2][2]) / d;
-        r[1][1] = (m[0][0] * m[2][2] - m[0][2] * m[2][0]) / d;
-        r[1][2] = (m[0][2] * m[1][0] - m[0][0] * m[1][2]) / d;
-        r[2][0] = (m[1][0] * m[2][1] - m[1][1] * m[2][0]) / d;
-        r[2][1] = (m[0][1] * m[2][0] - m[0][0] * m[2][1]) / d;
-        r[2][2] = (m[0][0] * m[1][1] - m[0][1] * m[1][0]) / d;
-        r
-    };
-    let cam1_h_cam4 = inv(&h4_from_1);
-    let mut global = multicam::MultiCameraTracker::new(vec![identity, cam1_h_cam4], 0.20);
+    let mut global = multicam::MultiCameraTracker::new(vec![identity, identity], 0.20);
 
     let rows1: Vec<sort::Track> = std::mem::take(&mut t1);
     let rows2: Vec<sort::Track> = std::mem::take(&mut t2);

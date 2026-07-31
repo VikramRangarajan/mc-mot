@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod calibration;
 mod detect;
 mod draw;
 mod multicam;
-mod npy;
 mod pipeline;
 mod sort;
 mod video;
