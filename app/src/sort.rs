@@ -31,7 +31,9 @@ fn linear_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
     let m = real_m.max(n);
     let size = m + 1;
     let mut padded = cost.to_vec();
-    for row in &mut padded { row.resize(m, 0.0); }
+    for row in &mut padded {
+        row.resize(m, 0.0);
+    }
     let mut u = vec![0f64; size];
     let mut v = vec![0f64; size];
     let mut p = vec![0usize; size];
@@ -48,7 +50,7 @@ fn linear_assignment(cost: &[Vec<f64>]) -> Vec<usize> {
             let mut j1 = 0usize;
             for j in 1..=m {
                 if !used[j] {
-                let cur = padded[i0 - 1][j - 1] - u[i0] - v[j];
+                    let cur = padded[i0 - 1][j - 1] - u[i0] - v[j];
                     if cur < minv[j] {
                         minv[j] = cur;
                         way[j] = j0;

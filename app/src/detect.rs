@@ -61,7 +61,12 @@ pub fn detect(net: &mut dnn::Net, img: &RgbImage, conf: f32, nms: f32) -> Result
     eprintln!("[detect] forward begin");
     let mut out = core::Mat::default();
     net.forward_layer_def(&mut out)?;
-    eprintln!("[detect] forward end dims={} total={} {:.2?}", out.dims(), out.total(), t0.elapsed());
+    eprintln!(
+        "[detect] forward end dims={} total={} {:.2?}",
+        out.dims(),
+        out.total(),
+        t0.elapsed()
+    );
     let data = out.data_typed::<f32>().context("YOLO output is not f32")?;
     let cols = if out.dims() == 3 {
         out.mat_size().get(2)? as usize
@@ -122,7 +127,9 @@ pub fn detect(net: &mut dnn::Net, img: &RgbImage, conf: f32, nms: f32) -> Result
         scores.push(score);
         // Keep pathological exports from feeding tens of thousands of boxes
         // into NMS and blocking the UI thread.
-        if scores.len() >= 4096 { break; }
+        if scores.len() >= 4096 {
+            break;
+        }
     }
     let mut keep = core::Vector::<i32>::new();
     eprintln!("[detect] nms candidates={}", scores.len());

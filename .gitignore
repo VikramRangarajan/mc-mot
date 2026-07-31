@@ -74,6 +74,8 @@ docs/_build/
 # PyBuilder
 .pybuilder/
 target/
+.cargo/config.toml
+app/.cargo/config.toml
 
 # Jupyter Notebook
 .ipynb_checkpoints

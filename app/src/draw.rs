@@ -78,7 +78,14 @@ pub fn draw_tracks(
         rect(&mut out, x1, y1, x2, y2, c);
         if let Some(points) = history.get(&gid) {
             for pair in points.windows(2) {
-                line(&mut out, pair[0].0.clamp(0, max_x as i32), pair[0].1.clamp(0, max_y as i32), pair[1].0.clamp(0, max_x as i32), pair[1].1.clamp(0, max_y as i32), c);
+                line(
+                    &mut out,
+                    pair[0].0.clamp(0, max_x as i32),
+                    pair[0].1.clamp(0, max_y as i32),
+                    pair[1].0.clamp(0, max_x as i32),
+                    pair[1].1.clamp(0, max_y as i32),
+                    c,
+                );
             }
         }
     }

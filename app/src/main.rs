@@ -5,6 +5,7 @@ mod detect;
 mod draw;
 mod multicam;
 mod npy;
+mod pipeline;
 mod sort;
 mod video;
 

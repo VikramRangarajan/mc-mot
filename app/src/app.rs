@@ -3,13 +3,13 @@ use eframe::egui;
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use crate::detect::{self, Detection};
+use crate::detect::Detection;
 use crate::draw;
 use crate::multicam::MultiCameraTracker;
 use crate::npy;
+use crate::pipeline::{FramePair, FramePipeline, OpenCvOnnxPipeline};
 use crate::sort::{Sort, Track, shared_id};
 use crate::video::{self, ExtractedVideo};
-use opencv::dnn;
 
 /// A single camera source: a list of frame images (either picked directly or
 /// extracted from a picked video).
@@ -29,7 +29,6 @@ impl CameraSource {
 }
 
 pub struct McMotApp {
-    model: Option<dnn::Net>,
     homographies: Vec<[[f64; 3]; 3]>,
     font: FontArc,
     status: String,
@@ -67,6 +66,8 @@ pub struct McMotApp {
     max_age: i64,
     iou_thres: f64,
     fps: f64,
+    pipeline: Option<OpenCvOnnxPipeline>,
+    pending_pipeline: bool,
 }
 
 fn homography_to_array(data: &[f64]) -> [[f64; 3]; 3] {
@@ -110,19 +111,6 @@ impl McMotApp {
             .unwrap()
             .join("data/cam4_H_cam1.npy");
 
-        let model = match dnn::read_net_from_onnx_def(model_path.to_str().unwrap()) {
-            Ok(mut net) => {
-                if let Err(e) = opencv::prelude::NetTrait::set_preferable_backend(&mut net, dnn::DNN_BACKEND_OPENCV) {
-                    eprintln!("warning: could not select OpenCV DNN backend: {e}");
-                }
-                Some(net)
-            }
-            Err(e) => {
-                eprintln!("warning: failed to load ONNX model from {model_path:?}: {e}");
-                None
-            }
-        };
-
         let (homographies, status) = match npy::load_f64_2d(homography_path.to_str().unwrap()) {
             Ok((data, rows, cols)) if rows == 3 && cols == 3 => {
                 let h_c4_from_c1 = homography_to_array(&data);
@@ -145,7 +133,6 @@ impl McMotApp {
         let tracker2 = Sort::new(30, 1, 0.1, &count);
 
         let mut app = Self {
-            model,
             homographies,
             font,
             status,
@@ -176,17 +163,32 @@ impl McMotApp {
             max_age: 30,
             iou_thres: 0.10,
             fps: 0.0,
+            pipeline: None,
+            pending_pipeline: false,
         };
 
         // Debug defaults: load the repository videos automatically when present.
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf();
-        for (path, cam) in [(root.join("data/cam1.mp4"), &mut app.cam1), (root.join("data/cam4.mp4"), &mut app.cam2)] {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        for (path, cam) in [
+            (root.join("data/cam1.mp4"), &mut app.cam1),
+            (root.join("data/cam4.mp4"), &mut app.cam2),
+        ] {
             if path.exists() {
                 match video::extract_frames(&path) {
-                    Ok(extracted) => { cam.frames = extracted.frames.clone(); cam.video = Some(extracted); }
+                    Ok(extracted) => {
+                        cam.frames = extracted.frames.clone();
+                        cam.video = Some(extracted);
+                    }
                     Err(e) => app.status = format!("failed to load {}: {e}", path.display()),
                 }
             }
+        }
+        match OpenCvOnnxPipeline::start(model_path) {
+            Ok(pipeline) => app.pipeline = Some(pipeline),
+            Err(e) => app.status = format!("failed to start pipeline worker: {e}"),
         }
         app
     }
@@ -205,15 +207,12 @@ impl McMotApp {
         self.tracks2.clear();
         self.hist1.clear();
         self.hist2.clear();
+        self.pending_pipeline = false;
     }
 
     /// Runs one frame couple through detect -> SORT -> global tracker.
     fn step(&mut self) {
         eprintln!("[app] step frame={}", self.frame);
-        let Some(model) = self.model.as_mut() else {
-            self.status = "no model loaded".to_string();
-            return;
-        };
         if self.homographies.len() < 2 {
             self.status = "homography not loaded".to_string();
             return;
@@ -230,38 +229,46 @@ impl McMotApp {
             return;
         }
 
-        let img1 = match image::open(&self.cam1.frames[i]) {
-            Ok(im) => im.to_rgb8(),
-            Err(e) => {
-                self.status = format!("failed to open {}: {e}", self.cam1.frames[i].display());
+        let result = if self.pending_pipeline {
+            let Some(pipeline) = &self.pipeline else {
+                self.status = "pipeline worker unavailable".into();
+                return;
+            };
+            match pipeline.try_result() {
+                Some(Ok(result)) => {
+                    self.pending_pipeline = false;
+                    result
+                }
+                Some(Err(e)) => {
+                    self.pending_pipeline = false;
+                    self.status = format!("pipeline failed: {e}");
+                    return;
+                }
+                None => return,
+            }
+        } else {
+            let Some(pipeline) = &self.pipeline else {
+                self.status = "pipeline worker unavailable".into();
+                return;
+            };
+            if let Err(e) = pipeline.submit(
+                FramePair {
+                    camera1: self.cam1.frames[i].clone(),
+                    camera2: self.cam2.frames[i].clone(),
+                },
+                self.conf,
+            ) {
+                self.status = format!("pipeline submit failed: {e}");
                 return;
             }
+            self.pending_pipeline = true;
+            return;
         };
-        let img2 = match image::open(&self.cam2.frames[i]) {
-            Ok(im) => im.to_rgb8(),
-            Err(e) => {
-                self.status = format!("failed to open {}: {e}", self.cam2.frames[i].display());
-                return;
-            }
-        };
-        eprintln!("[app] images loaded frame={}", i);
-
+        let img1 = result.image1;
+        let img2 = result.image2;
+        let dets1 = result.detections1;
+        let dets2 = result.detections2;
         let t0 = std::time::Instant::now();
-        let conf = self.conf;
-        let dets1 = match detect::detect(model, &img1, conf, 0.45) {
-            Ok(d) => d,
-            Err(e) => {
-                self.status = format!("camera 1 detection failed: {e}");
-                return;
-            }
-        };
-        let dets2 = match detect::detect(model, &img2, conf, 0.45) {
-            Ok(d) => d,
-            Err(e) => {
-                self.status = format!("camera 2 detection failed: {e}");
-                return;
-            }
-        };
         eprintln!("[app] detections {} {}", dets1.len(), dets2.len());
 
         // SORT expects integer bboxes.
@@ -283,9 +290,9 @@ impl McMotApp {
         let tracks2 = self.tracker2.update(&dets2, &labels2);
         eprintln!("[app] sort tracks {} {}", tracks1.len(), tracks2.len());
 
-        let global_tracker = self
-            .global_tracker
-            .get_or_insert_with(|| MultiCameraTracker::new(self.homographies.clone(), self.iou_thres));
+        let global_tracker = self.global_tracker.get_or_insert_with(|| {
+            MultiCameraTracker::new(self.homographies.clone(), self.iou_thres)
+        });
         let global_ids = global_tracker.update(&[tracks1.clone(), tracks2.clone()]);
         eprintln!("[app] global tracker done");
 
@@ -431,15 +438,21 @@ impl eframe::App for McMotApp {
                     self.reset_pipeline();
                     self.step();
                 }
-                if ui.button(if self.running { "Pause" } else { "Play" }).clicked() {
+                if ui
+                    .button(if self.running { "Pause" } else { "Play" })
+                    .clicked()
+                {
                     self.running = !self.running;
-                    if self.running { ui.ctx().request_repaint(); }
+                    if self.running {
+                        ui.ctx().request_repaint();
+                    }
                 }
                 if ui.button("Step").clicked() && !self.running {
-                        if self.frame == 0 {
-                            self.reset_pipeline();
-                        }
-                        self.step();
+                    if self.frame == 0 {
+                        self.reset_pipeline();
+                    }
+                    self.step();
+                    ui.ctx().request_repaint();
                 }
                 if ui.button("Clear").clicked() {
                     self.cam1.clear();
@@ -468,7 +481,11 @@ impl eframe::App for McMotApp {
                 ui.label("max age");
                 ui.add(egui::Slider::new(&mut self.max_age, 1..=120).show_value(true));
                 ui.label("SORT IOU");
-                ui.add(egui::Slider::new(&mut self.iou_thres, 0.0..=1.0).step_by(0.01).show_value(true));
+                ui.add(
+                    egui::Slider::new(&mut self.iou_thres, 0.0..=1.0)
+                        .step_by(0.01)
+                        .show_value(true),
+                );
                 if self.fps > 0.0 {
                     ui.separator();
                     ui.label(format!("{:.1} fps", self.fps));
@@ -478,6 +495,10 @@ impl eframe::App for McMotApp {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
+            if self.pending_pipeline {
+                ui.ctx()
+                    .request_repaint_after(std::time::Duration::from_millis(16));
+            }
             if self.running {
                 self.step();
                 // keep stepping until both sources are exhausted

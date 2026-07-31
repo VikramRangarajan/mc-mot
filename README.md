@@ -1,5 +1,19 @@
 # Multi Camera Multi-Object-Tracking (MC-MOT)
 
+## Rust build prerequisites
+
+The Rust OpenCV bindings require `libclang` during compilation. Install LLVM/Clang for your platform and configure it locally; machine-specific `.cargo/config.toml` files are intentionally ignored.
+
+macOS/Homebrew:
+
+```bash
+export LIBCLANG_PATH="$(brew --prefix llvm)/lib"
+export DYLD_LIBRARY_PATH="$(brew --prefix llvm)/lib${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+cargo run --release --manifest-path app/Cargo.toml
+```
+
+Linux: install `clang` and `libclang-dev`. Windows: install LLVM and set `LIBCLANG_PATH` to its `bin` directory.
+
 ## Install
 
 To install, run:
