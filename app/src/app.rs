@@ -7,7 +7,7 @@ use crate::calibration;
 use crate::detect::Detection;
 use crate::draw;
 use crate::multicam::MultiCameraTracker;
-use crate::pipeline::{FramePair, FramePipeline, OpenCvOnnxPipeline};
+use crate::pipeline::{FrameBatch, FramePipeline, OpenCvOnnxPipeline};
 use crate::sort::{Sort, Track, shared_id};
 use crate::video::{self, ExtractedVideo};
 
@@ -21,25 +21,16 @@ pub struct CameraSource {
     video: Option<ExtractedVideo>,
 }
 
-impl CameraSource {
-    fn clear(&mut self) {
-        self.frames.clear();
-        self.video = None;
-    }
-}
-
 pub struct McMotApp {
     homographies: Vec<[[f64; 3]; 3]>,
     font: FontArc,
     status: String,
 
-    /// Frame sources for camera 1 and camera 2.
-    cam1: CameraSource,
-    cam2: CameraSource,
+    /// Frame sources for all cameras. Camera 0 is the reference plane.
+    cameras: Vec<CameraSource>,
 
     /// Per-camera SORT trackers.
-    tracker1: Sort,
-    tracker2: Sort,
+    trackers: Vec<Sort>,
 
     global_tracker: Option<MultiCameraTracker>,
 
@@ -48,17 +39,13 @@ pub struct McMotApp {
     running: bool,
 
     /// Last displayed results.
-    vis1: Option<egui::ColorImage>,
-    vis2: Option<egui::ColorImage>,
-    tex1: Option<egui::TextureHandle>,
-    tex2: Option<egui::TextureHandle>,
-    tracks1: Vec<Track>,
-    tracks2: Vec<Track>,
+    vis: Vec<Option<egui::ColorImage>>,
+    tex: Vec<Option<egui::TextureHandle>>,
+    tracks: Vec<Vec<Track>>,
     global_ids: Vec<HashMap<i64, i64>>,
 
     /// Centroid history per camera (for trail drawing).
-    hist1: draw::History,
-    hist2: draw::History,
+    histories: Vec<draw::History>,
 
     /// Detection / tracking parameters (tunable in the toolbar).
     conf: f32,
@@ -74,8 +61,7 @@ pub struct McMotApp {
 
 #[derive(Clone)]
 struct CachedFrame {
-    tracks1: Vec<Track>,
-    tracks2: Vec<Track>,
+    tracks: Vec<Vec<Track>>,
     global_ids: Vec<HashMap<i64, i64>>,
 }
 
@@ -88,42 +74,26 @@ impl McMotApp {
             .unwrap()
             .join("models/rfdetr-medium.onnx");
         let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let homographies = vec![identity, identity];
-        let status = "calibrating homography online...".to_string();
+        let homographies = vec![identity];
+        let status = "add camera sources to begin".to_string();
 
         // Load a system font for drawing labels.
         let font = load_font();
-
-        let count = shared_id();
-        let tracker1 = Sort::new(30, 1, 0.1, &count);
-        let tracker2 = Sort::new(30, 1, 0.1, &count);
 
         let mut app = Self {
             homographies,
             font,
             status,
-            cam1: CameraSource {
-                name: "Camera 1".into(),
-                ..Default::default()
-            },
-            cam2: CameraSource {
-                name: "Camera 2".into(),
-                ..Default::default()
-            },
-            tracker1,
-            tracker2,
+            cameras: Vec::new(),
+            trackers: Vec::new(),
             global_tracker: None,
             frame: 0,
             running: false,
-            vis1: None,
-            vis2: None,
-            tex1: None,
-            tex2: None,
-            tracks1: Vec::new(),
-            tracks2: Vec::new(),
+            vis: Vec::new(),
+            tex: Vec::new(),
+            tracks: Vec::new(),
             global_ids: Vec::new(),
-            hist1: HashMap::new(),
-            hist2: HashMap::new(),
+            histories: Vec::new(),
             conf: 0.30,
             min_hits: 1,
             max_age: 30,
@@ -135,26 +105,6 @@ impl McMotApp {
             cache: Vec::new(),
         };
 
-        // Debug defaults: load the repository videos automatically when present.
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .to_path_buf();
-        for (path, cam) in [
-            (root.join("data/cam1.mp4"), &mut app.cam1),
-            (root.join("data/cam4.mp4"), &mut app.cam2),
-        ] {
-            if path.exists() {
-                match video::extract_frames(&path) {
-                    Ok(extracted) => {
-                        cam.frames = extracted.frames.clone();
-                        cam.video = Some(extracted);
-                    }
-                    Err(e) => app.status = format!("failed to load {}: {e}", path.display()),
-                }
-            }
-        }
-        app.recalibrate_homography();
         match OpenCvOnnxPipeline::start(model_path) {
             Ok(pipeline) => app.pipeline = Some(pipeline),
             Err(e) => app.status = format!("failed to start pipeline worker: {e}"),
@@ -164,55 +114,63 @@ impl McMotApp {
 
     fn reset_pipeline(&mut self) {
         let count = shared_id();
-        self.tracker1 = Sort::new(self.max_age, self.min_hits, self.iou_thres, &count);
-        self.tracker2 = Sort::new(self.max_age, self.min_hits, self.iou_thres, &count);
+        self.trackers = (0..self.cameras.len())
+            .map(|_| Sort::new(self.max_age, self.min_hits, self.iou_thres, &count))
+            .collect();
         self.global_tracker = None;
         self.frame = 0;
-        self.vis1 = None;
-        self.vis2 = None;
-        self.tex1 = None;
-        self.tex2 = None;
-        self.tracks1.clear();
-        self.tracks2.clear();
-        self.hist1.clear();
-        self.hist2.clear();
+        self.vis = vec![None; self.cameras.len()];
+        self.tex = (0..self.cameras.len()).map(|_| None).collect();
+        self.tracks = vec![Vec::new(); self.cameras.len()];
+        self.histories = (0..self.cameras.len()).map(|_| HashMap::new()).collect();
+        self.global_ids = vec![HashMap::new(); self.cameras.len()];
         self.pending_pipeline = false;
     }
 
-    /// Re-estimates the camera-1/camera-2 mapping from the first available
-    /// frame pair. This must run whenever either source changes because a new
-    /// camera view generally has a different image-to-image transform.
+    /// Re-estimates every camera's mapping into camera 0's reference plane.
     fn recalibrate_homography(&mut self) {
         let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        let Some(path1) = self.cam1.frames.first() else {
-            self.homographies = vec![identity, identity];
-            self.status = "add camera 1 and camera 2 sources to calibrate".into();
+        let Some(reference) = self.cameras.first().and_then(|c| c.frames.first()) else {
+            self.homographies = Vec::new();
+            self.status = "add camera sources to begin".into();
             return;
         };
-        let Some(path2) = self.cam2.frames.first() else {
-            self.homographies = vec![identity, identity];
-            self.status = "add camera 2 source to calibrate".into();
+        let Ok(reference) = image::open(reference).map(|image| image.to_rgb8()) else {
+            self.homographies = vec![identity; self.cameras.len()];
+            self.status = "could not load reference calibration frame".into();
             return;
         };
-
+        let mut homographies = vec![identity];
         self.status = "calibrating homography online...".into();
-        match (image::open(path1), image::open(path2)) {
-            (Ok(first), Ok(second)) => {
-                match calibration::estimate(&first.to_rgb8(), &second.to_rgb8()) {
-                    Ok(h) => {
-                        self.homographies = vec![identity, calibration::invert(&h)];
-                        self.status = "online SIFT homography calibrated".into();
-                    }
+        for camera in self.cameras.iter().skip(1) {
+            let Some(path) = camera.frames.first() else {
+                homographies.push(identity);
+                continue;
+            };
+            match image::open(path).map(|image| image.to_rgb8()) {
+                Ok(image) => match calibration::estimate(&reference, &image) {
+                    Ok(h) => homographies.push(calibration::invert(&h)),
                     Err(e) => {
-                        self.homographies = vec![identity, identity];
-                        self.status = format!("online homography failed: {e}");
+                        homographies.push(identity);
+                        self.status = format!("homography failed for {}: {e}", camera.name);
                     }
+                },
+                Err(e) => {
+                    homographies.push(identity);
+                    self.status = format!("could not load {} calibration frame: {e}", camera.name);
                 }
             }
-            _ => {
-                self.homographies = vec![identity, identity];
-                self.status = "could not load calibration frames".into();
-            }
+        }
+        self.homographies = homographies;
+        if self.status == "calibrating homography online..." {
+            self.status = if self.cameras.len() == 1 {
+                "reference camera loaded; add another camera to calibrate".into()
+            } else {
+                format!(
+                    "online SIFT homography calibrated for {} cameras",
+                    self.cameras.len()
+                )
+            };
         }
     }
 
@@ -222,59 +180,51 @@ impl McMotApp {
         self.recalibrate_homography();
     }
 
-    /// Runs one frame couple through detect -> SORT -> global tracker.
+    /// Runs one synchronized frame from every camera through detect -> SORT -> global tracker.
     fn step(&mut self) {
         eprintln!("[app] step frame={}", self.frame);
-        if self.homographies.len() < 2 {
-            self.status = "homography not loaded".to_string();
+        if self.cameras.is_empty() {
+            self.status = "add camera sources first".to_string();
             return;
         }
-        if self.cam1.frames.is_empty() || self.cam2.frames.is_empty() {
-            self.status = "add frames for both cameras first".to_string();
+        if self.homographies.len() != self.cameras.len() {
+            self.status = "homographies are not ready".to_string();
             return;
         }
-
         let i = self.frame;
-        if i >= self.cam1.frames.len() || i >= self.cam2.frames.len() {
+        let frame_count = self
+            .cameras
+            .iter()
+            .map(|camera| camera.frames.len())
+            .min()
+            .unwrap_or(0);
+        if i >= frame_count {
             self.status = "all frames processed".to_string();
             self.running = false;
             return;
         }
 
-        // Replays and backward scrubs use metadata only; source images are
-        // decoded on demand and no detector inference is performed.
         if let Some(Some(cached)) = self.cache.get(i).cloned()
-            && let (Ok(image1), Ok(image2)) = (
-                image::open(&self.cam1.frames[i]),
-                image::open(&self.cam2.frames[i]),
-            )
+            && cached.tracks.len() == self.cameras.len()
+            && cached.global_ids.len() == self.cameras.len()
         {
-            let image1 = image1.to_rgb8();
-            let image2 = image2.to_rgb8();
-            let vis1 = draw::draw_tracks(
-                &image1,
-                &cached.tracks1,
-                &cached.global_ids[0],
-                &mut self.hist1,
-                &self.font,
-            );
-            let vis2 = draw::draw_tracks(
-                &image2,
-                &cached.tracks2,
-                &cached.global_ids[1],
-                &mut self.hist2,
-                &self.font,
-            );
-            self.vis1 = Some(egui::ColorImage::from_rgb(
-                [vis1.width() as usize, vis1.height() as usize],
-                vis1.as_raw(),
-            ));
-            self.vis2 = Some(egui::ColorImage::from_rgb(
-                [vis2.width() as usize, vis2.height() as usize],
-                vis2.as_raw(),
-            ));
-            self.tracks1 = cached.tracks1;
-            self.tracks2 = cached.tracks2;
+            for (camera_index, camera) in self.cameras.iter().enumerate() {
+                let Ok(image) = image::open(&camera.frames[i]).map(|image| image.to_rgb8()) else {
+                    continue;
+                };
+                let rendered = draw::draw_tracks(
+                    &image,
+                    &cached.tracks[camera_index],
+                    &cached.global_ids[camera_index],
+                    &mut self.histories[camera_index],
+                    &self.font,
+                );
+                self.vis[camera_index] = Some(egui::ColorImage::from_rgb(
+                    [rendered.width() as usize, rendered.height() as usize],
+                    rendered.as_raw(),
+                ));
+            }
+            self.tracks = cached.tracks;
             self.global_ids = cached.global_ids;
             self.frame += 1;
             self.status = format!("cached frame {}", i);
@@ -303,25 +253,25 @@ impl McMotApp {
                 self.status = "pipeline worker unavailable".into();
                 return;
             };
-            if let Err(e) = pipeline.submit(
-                FramePair {
-                    camera1: self.cam1.frames[i].clone(),
-                    camera2: self.cam2.frames[i].clone(),
-                },
-                self.conf,
-            ) {
+            let cameras = self
+                .cameras
+                .iter()
+                .map(|camera| camera.frames[i].clone())
+                .collect();
+            if let Err(e) = pipeline.submit(FrameBatch { cameras }, self.conf) {
                 self.status = format!("pipeline submit failed: {e}");
                 return;
             }
             self.pending_pipeline = true;
             return;
         };
-        let img1 = result.image1;
-        let img2 = result.image2;
-        let dets1 = result.detections1;
-        let dets2 = result.detections2;
+        if result.images.len() != self.cameras.len()
+            || result.detections.len() != self.cameras.len()
+        {
+            self.status = "pipeline returned the wrong number of cameras".into();
+            return;
+        }
         let t0 = std::time::Instant::now();
-        eprintln!("[app] detections {} {}", dets1.len(), dets2.len());
 
         // SORT expects integer bboxes.
         let to_xyxy = |d: &Detection| {
@@ -332,40 +282,42 @@ impl McMotApp {
                 d.y2 as i64 as f64,
             ]
         };
-        let dets1: Vec<[f64; 4]> = dets1.iter().map(to_xyxy).collect();
-        let dets2: Vec<[f64; 4]> = dets2.iter().map(to_xyxy).collect();
-
-        let labels1 = vec![0i64; dets1.len()];
-        let labels2 = vec![0i64; dets2.len()];
-
-        let tracks1 = self.tracker1.update(&dets1, &labels1);
-        let tracks2 = self.tracker2.update(&dets2, &labels2);
-        eprintln!("[app] sort tracks {} {}", tracks1.len(), tracks2.len());
+        let tracks: Vec<Vec<Track>> = result
+            .detections
+            .iter()
+            .enumerate()
+            .map(|(camera_index, detections)| {
+                let boxes: Vec<[f64; 4]> = detections.iter().map(to_xyxy).collect();
+                let labels = vec![0i64; boxes.len()];
+                self.trackers[camera_index].update(&boxes, &labels)
+            })
+            .collect();
 
         let global_tracker = self.global_tracker.get_or_insert_with(|| {
             MultiCameraTracker::new(self.homographies.clone(), self.iou_thres)
         });
-        let global_ids = global_tracker.update(&[tracks1.clone(), tracks2.clone()]);
-        eprintln!("[app] global tracker done");
-
-        let vis1 = draw::draw_tracks(&img1, &tracks1, &global_ids[0], &mut self.hist1, &self.font);
-        let vis2 = draw::draw_tracks(&img2, &tracks2, &global_ids[1], &mut self.hist2, &self.font);
+        let global_ids = global_tracker.update(&tracks);
 
         let to_color = |im: &image::RgbImage| {
             egui::ColorImage::from_rgb([im.width() as usize, im.height() as usize], im.as_raw())
         };
-
-        self.vis1 = Some(to_color(&vis1));
-        self.vis2 = Some(to_color(&vis2));
-        self.tracks1 = tracks1;
-        self.tracks2 = tracks2;
+        for camera_index in 0..self.cameras.len() {
+            let rendered = draw::draw_tracks(
+                &result.images[camera_index],
+                &tracks[camera_index],
+                &global_ids[camera_index],
+                &mut self.histories[camera_index],
+                &self.font,
+            );
+            self.vis[camera_index] = Some(to_color(&rendered));
+        }
+        self.tracks = tracks;
         self.global_ids = global_ids;
         if self.cache.len() <= i {
             self.cache.resize_with(i + 1, || None);
         }
         self.cache[i] = Some(CachedFrame {
-            tracks1: self.tracks1.clone(),
-            tracks2: self.tracks2.clone(),
+            tracks: self.tracks.clone(),
             global_ids: self.global_ids.clone(),
         });
         self.frame += 1;
@@ -374,8 +326,8 @@ impl McMotApp {
         self.status = format!(
             "frame {}: {} / {} tracks ({:?})",
             i,
-            self.tracks1.len(),
-            self.tracks2.len(),
+            self.tracks.iter().map(Vec::len).sum::<usize>(),
+            self.cameras.len(),
             elapsed
         );
         eprintln!("[app] frame complete {}", i);
@@ -482,32 +434,42 @@ impl eframe::App for McMotApp {
         egui::Panel::top("toolbar").show(ui, |ui| {
             ui.add_space(4.0);
             ui.horizontal(|ui| {
-                if ui.button("Add Camera 1...").clicked() {
-                    let cam = &mut self.cam1;
-                    let _ = pick_source(cam);
-                    self.source_changed();
-                }
-                if ui.button("Add Camera 2...").clicked() {
-                    let cam = &mut self.cam2;
-                    let _ = pick_source(cam);
-                    self.source_changed();
+                if ui.button("Add Camera...").clicked() {
+                    let index = self.cameras.len();
+                    let mut camera = CameraSource {
+                        name: format!("Camera {}", index + 1),
+                        ..Default::default()
+                    };
+                    let message = pick_source(&mut camera);
+                    if !camera.frames.is_empty() {
+                        self.cameras.push(camera);
+                        self.source_changed();
+                    } else {
+                        self.status = message;
+                    }
                 }
                 ui.separator();
                 if ui.button("Clear").clicked() {
-                    self.cam1.clear();
-                    self.cam2.clear();
+                    self.cameras.clear();
                     self.reset_pipeline();
                     self.cache.clear();
-                    self.status.clear();
+                    self.homographies.clear();
+                    self.status = "add camera sources to begin".into();
                 }
                 ui.separator();
                 ui.label(format!(
-                    "camera 1: {} frame(s) | camera 2: {} frame(s) | frame {}",
-                    self.cam1.frames.len(),
-                    self.cam2.frames.len(),
+                    "{} camera(s) | frame {}",
+                    self.cameras.len(),
                     self.frame
                 ));
             });
+            if !self.cameras.is_empty() {
+                ui.horizontal_wrapped(|ui| {
+                    for camera in &self.cameras {
+                        ui.label(format!("{}: {} frame(s)", camera.name, camera.frames.len()));
+                    }
+                });
+            }
             ui.add_space(4.0);
             ui.horizontal(|ui| {
                 ui.label("conf");
@@ -535,7 +497,12 @@ impl eframe::App for McMotApp {
         });
 
         egui::Panel::bottom("transport").show(ui, |ui| {
-            let frame_count = self.cam1.frames.len().min(self.cam2.frames.len());
+            let frame_count = self
+                .cameras
+                .iter()
+                .map(|camera| camera.frames.len())
+                .min()
+                .unwrap_or(0);
             let mut selected = self.frame.min(frame_count.saturating_sub(1));
             if frame_count > 0
                 && ui
@@ -550,19 +517,14 @@ impl eframe::App for McMotApp {
                 // Show the selected source images immediately. Tracking overlays
                 // are applied when cached metadata is available or when the
                 // selected frame is processed with Step/Play.
-                if let Ok(image) = image::open(&self.cam1.frames[selected]) {
-                    let image = image.to_rgb8();
-                    self.vis1 = Some(egui::ColorImage::from_rgb(
-                        [image.width() as usize, image.height() as usize],
-                        image.as_raw(),
-                    ));
-                }
-                if let Ok(image) = image::open(&self.cam2.frames[selected]) {
-                    let image = image.to_rgb8();
-                    self.vis2 = Some(egui::ColorImage::from_rgb(
-                        [image.width() as usize, image.height() as usize],
-                        image.as_raw(),
-                    ));
+                for (camera_index, camera) in self.cameras.iter().enumerate() {
+                    if let Ok(image) = image::open(&camera.frames[selected]) {
+                        let image = image.to_rgb8();
+                        self.vis[camera_index] = Some(egui::ColorImage::from_rgb(
+                            [image.width() as usize, image.height() as usize],
+                            image.as_raw(),
+                        ));
+                    }
                 }
                 self.status = format!("seeked to frame {selected}");
             }
@@ -609,7 +571,14 @@ impl eframe::App for McMotApp {
             if self.running {
                 self.step();
                 // keep stepping until both sources are exhausted
-                if self.frame >= self.cam1.frames.len() || self.frame >= self.cam2.frames.len() {
+                if self.frame
+                    >= self
+                        .cameras
+                        .iter()
+                        .map(|camera| camera.frames.len())
+                        .min()
+                        .unwrap_or(0)
+                {
                     self.running = false;
                 }
                 // The source videos are 30 FPS. Inference remains asynchronous;
@@ -624,10 +593,10 @@ impl eframe::App for McMotApp {
                 ui.separator();
             }
 
-            if self.vis1.is_none() && self.vis2.is_none() {
+            if self.vis.iter().all(Option::is_none) {
                 ui.centered_and_justified(|ui| {
                     ui.label(
-                        "Add images or videos for camera 1 and camera 2, then press Play.\n\
+                        "Add two or more camera sources, then press Play.\n\
                          The pipeline is: RF-DETR ONNX person detection -> per-camera SORT ->\n\
                          homography-based global track fusion.",
                     );
@@ -636,14 +605,27 @@ impl eframe::App for McMotApp {
                 egui::ScrollArea::both().show(ui, |ui| {
                     let avail = ui.available_size();
                     let spacing = 12.0;
-                    let max = egui::vec2((avail.x - spacing) / 2.0, (avail.y - spacing) / 2.0);
+                    let columns = (self.cameras.len() as f32).sqrt().ceil().max(1.0) as usize;
+                    let max = egui::vec2(
+                        (avail.x - spacing * (columns.saturating_sub(1) as f32)) / columns as f32,
+                        (avail.y - spacing * (columns.saturating_sub(1) as f32)) / columns as f32,
+                    );
                     egui::Grid::new("camera_grid")
-                        .num_columns(2)
+                        .num_columns(columns)
                         .spacing(egui::vec2(spacing, spacing))
                         .show(ui, |ui| {
-                            show_image(ui, &self.cam1.name, &self.vis1, &mut self.tex1, max);
-                            show_image(ui, &self.cam2.name, &self.vis2, &mut self.tex2, max);
-                            ui.end_row();
+                            for (camera_index, camera) in self.cameras.iter().enumerate() {
+                                show_image(
+                                    ui,
+                                    &camera.name,
+                                    &self.vis[camera_index],
+                                    &mut self.tex[camera_index],
+                                    max,
+                                );
+                                if (camera_index + 1) % columns == 0 {
+                                    ui.end_row();
+                                }
+                            }
                         });
                 });
             }

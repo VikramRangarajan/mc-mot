@@ -71,6 +71,9 @@ impl MultiCameraTracker {
     /// Consumes one frame of per-camera tracks (each `Track.id` is the local
     /// SORT id) and returns, per camera, a mapping from local id to global id.
     pub fn update(&mut self, tracks: &[Vec<Track>]) -> Vec<HashMap<i64, i64>> {
+        if tracks.len() != self.num_sources {
+            return vec![HashMap::new(); self.num_sources];
+        }
         // Project tracks to the common reference plane
         let proj: Vec<Vec<Track>> = tracks
             .iter()
@@ -78,90 +81,46 @@ impl MultiCameraTracker {
             .map(|(i, trks)| modify_bbox_source(trks, &self.homographies[i]))
             .collect();
 
-        // For each pair of sources
+        // Give every visible local track an ID before cross-camera association.
+        // This makes one-camera and N-camera operation well-defined.
+        for (source, source_tracks) in proj.iter().enumerate() {
+            for track in source_tracks {
+                self.ids[source].entry(track.id).or_insert_with(|| {
+                    let id = self.next_id;
+                    self.next_id += 1;
+                    id
+                });
+                *self.age[source].entry(track.id).or_insert(0) += 1;
+            }
+        }
+
+        // Associate every camera pair in the common reference plane. Matching
+        // is used to merge identities, so a third or fourth camera can join an
+        // identity already established by an earlier pair.
         for i in 0..self.num_sources {
             for j in (i + 1)..self.num_sources {
-                // Match tracks with IOU
-                let mut matched: HashMap<i64, bool> = HashMap::new();
                 let dets: Vec<[f64; 4]> = proj[i].iter().map(box4).collect();
                 let trks: Vec<[f64; 4]> = proj[j].iter().map(box4).collect();
-                let (matches, unmatches_i, unmatches_j) =
+                let (matches, _, _) =
                     associate_detections_to_trackers(&dets, &trks, self.iou_thres);
-
-                // Set global ids for the matched tracks
                 for (idx_i, idx_j) in matches {
                     let id_i = proj[i][idx_i].id;
                     let id_j = proj[j][idx_j].id;
-                    let match_i = self.ids[i].get(&id_i).copied();
-                    let match_j = self.ids[j].get(&id_j).copied();
-
-                    // If track i has a global id and is at least as old as track j
-                    let assigned = if let Some(mi) = match_i {
-                        let age_i = self.age[i].get(&id_i).copied().unwrap_or(0);
-                        let age_j = self.age[j].get(&id_j).copied().unwrap_or(0);
-                        if age_i >= age_j && !matched.contains_key(&mi) {
-                            self.ids[j].insert(id_j, mi);
-                            matched.insert(mi, true);
-                            true
-                        } else {
-                            false
+                    let global_i = self.ids[i][&id_i];
+                    let global_j = self.ids[j][&id_j];
+                    if global_i != global_j {
+                        let age_i = self.age[i][&id_i];
+                        let age_j = self.age[j][&id_j];
+                        let keep = if age_i >= age_j { global_i } else { global_j };
+                        let replace = if keep == global_i { global_j } else { global_i };
+                        for source_ids in &mut self.ids {
+                            for id in source_ids.values_mut() {
+                                if *id == replace {
+                                    *id = keep;
+                                }
+                            }
                         }
-                    } else {
-                        false
-                    };
-                    // Else if track j has a global id
-                    let assigned = if assigned {
-                        true
-                    } else if let Some(mj) = match_j {
-                        if let std::collections::hash_map::Entry::Vacant(e) = matched.entry(mj) {
-                            self.ids[i].insert(id_i, mj);
-                            e.insert(true);
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-                    // None of them has a global id
-                    if !assigned {
-                        self.ids[i].insert(id_i, self.next_id);
-                        self.ids[j].insert(id_j, self.next_id);
-                        matched.insert(self.next_id, true);
-                        self.next_id += 1;
                     }
-
-                    // Increment track age
-                    let a = self.age[i].get(&id_i).copied().unwrap_or(0) + 1;
-                    self.age[i].insert(id_i, a);
-                    let a = self.age[j].get(&id_j).copied().unwrap_or(0) + 1;
-                    self.age[j].insert(id_j, a);
-                }
-
-                // Set global ids for unmatched tracks of source i
-                for &idx_i in &unmatches_i {
-                    let id_i = proj[i][idx_i].id;
-                    let match_i = self.ids[i].get(&id_i).copied();
-                    if match_i.is_none() || matched.contains_key(&match_i.unwrap()) {
-                        self.ids[i].insert(id_i, self.next_id);
-                        matched.insert(self.next_id, true);
-                        self.next_id += 1;
-                    }
-                    let a = self.age[i].get(&id_i).copied().unwrap_or(0) + 1;
-                    self.age[i].insert(id_i, a);
-                }
-
-                // Set global ids for unmatched tracks of source j
-                for &idx_j in &unmatches_j {
-                    let id_j = proj[j][idx_j].id;
-                    let match_j = self.ids[j].get(&id_j).copied();
-                    if match_j.is_none() || matched.contains_key(&match_j.unwrap()) {
-                        self.ids[j].insert(id_j, self.next_id);
-                        matched.insert(self.next_id, true);
-                        self.next_id += 1;
-                    }
-                    let a = self.age[j].get(&id_j).copied().unwrap_or(0) + 1;
-                    self.age[j].insert(id_j, a);
                 }
             }
         }

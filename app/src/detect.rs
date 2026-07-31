@@ -47,24 +47,37 @@ pub fn detect(net: &mut dnn::Net, img: &RgbImage, conf: f32, _nms: f32) -> Resul
         0.0,
         imgproc::INTER_LINEAR,
     )?;
-    let pixels = resized.data_bytes()?;
-    let plane = (INPUT_SIZE * INPUT_SIZE) as usize;
-    let means = [0.485_f32, 0.456, 0.406];
-    let stds = [0.229_f32, 0.224, 0.225];
-    let mut input = vec![0.0_f32; 3 * plane];
-    for y in 0..INPUT_SIZE as usize {
-        for x in 0..INPUT_SIZE as usize {
-            let pixel = (y * INPUT_SIZE as usize + x) * 3;
-            for channel in 0..3 {
-                // resized is BGR; the model expects RGB in NCHW order.
-                let value = pixels[pixel + (2 - channel)] as f32 / 255.0;
-                input[channel * plane + y * INPUT_SIZE as usize + x] =
-                    (value - means[channel]) / stds[channel];
-            }
-        }
+    // blob_from_image performs the BGR -> RGB conversion and packs the image
+    // directly into the model's NCHW layout. Normalize each planar channel
+    // with OpenCV's vectorized convert_to rather than copying pixels in Rust.
+    let mut input = dnn::blob_from_image(
+        &resized,
+        1.0 / 255.0,
+        core::Size::new(INPUT_SIZE, INPUT_SIZE),
+        core::Scalar::default(),
+        true,
+        false,
+        core::CV_32F,
+    )?;
+    // After reshape(1, 3 * INPUT_SIZE), each channel is INPUT_SIZE rows by
+    // INPUT_SIZE columns.
+    let plane_rows = INPUT_SIZE;
+    let means = [0.485_f64, 0.456, 0.406];
+    let stds = [0.229_f64, 0.224, 0.225];
+    let mut input_2d = input.reshape_mut(1, 3 * INPUT_SIZE)?;
+    for channel in 0..3 {
+        let range = core::Range::new(channel * plane_rows, (channel + 1) * plane_rows)?;
+        let mut channel_view = input_2d.row_range_mut(&range)?;
+        let mut normalized = core::Mat::default();
+        channel_view.convert_to(
+            &mut normalized,
+            core::CV_32F,
+            1.0 / stds[channel as usize],
+            -means[channel as usize] / stds[channel as usize],
+        )?;
+        normalized.copy_to(&mut channel_view)?;
     }
-    let input_storage = core::Mat::from_slice(&input)?;
-    let input = input_storage.reshape_nd(1, &[1, 3, INPUT_SIZE, INPUT_SIZE])?;
+    drop(input_2d);
     net.set_input(&input, "", 1.0, core::Scalar::default())?;
 
     let names = net.get_unconnected_out_layers_names()?;
