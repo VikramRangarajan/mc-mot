@@ -154,20 +154,7 @@ impl McMotApp {
                 }
             }
         }
-        if let (Some(path1), Some(path2)) = (app.cam1.frames.first(), app.cam2.frames.first()) {
-            match (image::open(path1), image::open(path2)) {
-                (Ok(first), Ok(second)) => {
-                    match calibration::estimate(&first.to_rgb8(), &second.to_rgb8()) {
-                        Ok(h) => {
-                            app.homographies = vec![identity, calibration::invert(&h)];
-                            app.status = "online SIFT homography calibrated".into();
-                        }
-                        Err(e) => app.status = format!("online homography failed: {e}"),
-                    }
-                }
-                _ => app.status = "could not load calibration frames".into(),
-            }
-        }
+        app.recalibrate_homography();
         match OpenCvOnnxPipeline::start(model_path) {
             Ok(pipeline) => app.pipeline = Some(pipeline),
             Err(e) => app.status = format!("failed to start pipeline worker: {e}"),
@@ -190,6 +177,49 @@ impl McMotApp {
         self.hist1.clear();
         self.hist2.clear();
         self.pending_pipeline = false;
+    }
+
+    /// Re-estimates the camera-1/camera-2 mapping from the first available
+    /// frame pair. This must run whenever either source changes because a new
+    /// camera view generally has a different image-to-image transform.
+    fn recalibrate_homography(&mut self) {
+        let identity = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let Some(path1) = self.cam1.frames.first() else {
+            self.homographies = vec![identity, identity];
+            self.status = "add camera 1 and camera 2 sources to calibrate".into();
+            return;
+        };
+        let Some(path2) = self.cam2.frames.first() else {
+            self.homographies = vec![identity, identity];
+            self.status = "add camera 2 source to calibrate".into();
+            return;
+        };
+
+        self.status = "calibrating homography online...".into();
+        match (image::open(path1), image::open(path2)) {
+            (Ok(first), Ok(second)) => {
+                match calibration::estimate(&first.to_rgb8(), &second.to_rgb8()) {
+                    Ok(h) => {
+                        self.homographies = vec![identity, calibration::invert(&h)];
+                        self.status = "online SIFT homography calibrated".into();
+                    }
+                    Err(e) => {
+                        self.homographies = vec![identity, identity];
+                        self.status = format!("online homography failed: {e}");
+                    }
+                }
+            }
+            _ => {
+                self.homographies = vec![identity, identity];
+                self.status = "could not load calibration frames".into();
+            }
+        }
+    }
+
+    fn source_changed(&mut self) {
+        self.reset_pipeline();
+        self.cache.clear();
+        self.recalibrate_homography();
     }
 
     /// Runs one frame couple through detect -> SORT -> global tracker.
@@ -454,13 +484,13 @@ impl eframe::App for McMotApp {
             ui.horizontal(|ui| {
                 if ui.button("Add Camera 1...").clicked() {
                     let cam = &mut self.cam1;
-                    let msg = pick_source(cam);
-                    self.status = msg;
+                    let _ = pick_source(cam);
+                    self.source_changed();
                 }
                 if ui.button("Add Camera 2...").clicked() {
                     let cam = &mut self.cam2;
-                    let msg = pick_source(cam);
-                    self.status = msg;
+                    let _ = pick_source(cam);
+                    self.source_changed();
                 }
                 ui.separator();
                 if ui.button("Clear").clicked() {

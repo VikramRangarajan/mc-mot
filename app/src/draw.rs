@@ -49,6 +49,86 @@ fn rect(img: &mut RgbImage, x1: i32, y1: i32, x2: i32, y2: i32, c: Rgb<u8>) {
         line(img, x1 + d, y2 - d, x1 + d, y1 + d, c);
     }
 }
+
+fn fill_rect(img: &mut RgbImage, x1: i32, y1: i32, x2: i32, y2: i32, c: Rgb<u8>) {
+    for y in y1..=y2 {
+        for x in x1..=x2 {
+            pixel(img, x, y, c);
+        }
+    }
+}
+
+fn glyph(ch: char) -> [u8; 7] {
+    match ch {
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        '-' => [0, 0, 0, 0b11111, 0, 0, 0],
+        _ => [0; 7],
+    }
+}
+
+fn label(img: &mut RgbImage, x: i32, y: i32, text: &str, color: Rgb<u8>) {
+    const SCALE: i32 = 2;
+    const ADVANCE: i32 = 6 * SCALE;
+    let width = text.chars().count() as i32 * ADVANCE + SCALE;
+    let height = 7 * SCALE + 2 * SCALE;
+    let top = y.max(0);
+    let left = x.max(0);
+    fill_rect(img, left, top, left + width, top + height, Rgb([0, 0, 0]));
+    for (index, ch) in text.chars().enumerate() {
+        let pattern = glyph(ch);
+        let x0 = left + SCALE + index as i32 * ADVANCE;
+        for (row, bits) in pattern.iter().enumerate() {
+            for col in 0..5 {
+                if bits & (1 << (4 - col)) != 0 {
+                    fill_rect(
+                        img,
+                        x0 + col * SCALE,
+                        top + SCALE + row as i32 * SCALE,
+                        x0 + col * SCALE + SCALE - 1,
+                        top + SCALE + row as i32 * SCALE + SCALE - 1,
+                        color,
+                    );
+                }
+            }
+        }
+    }
+}
+
 pub fn draw_tracks(
     img: &RgbImage,
     tracks: &[Track],
@@ -76,6 +156,13 @@ pub fn draw_tracks(
         let x2 = t.x2.clamp(0.0, max_x) as i32;
         let y2 = t.y2.clamp(0.0, max_y) as i32;
         rect(&mut out, x1, y1, x2, y2, c);
+        label(
+            &mut out,
+            x1,
+            y1 - 18,
+            &format!("ID {gid}"),
+            Rgb([255, 255, 255]),
+        );
         if let Some(points) = history.get(&gid) {
             for pair in points.windows(2) {
                 line(
